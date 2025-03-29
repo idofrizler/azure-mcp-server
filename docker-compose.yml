@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  azure-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+    environment:
+      - AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+    stdin_open: true  # Keep STDIN open even if not attached
+    tty: true        # Allocate a pseudo-TTY
+    # For debugging/interactive use only - normally the MCP server runs with stdio transport
