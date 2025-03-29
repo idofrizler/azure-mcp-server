@@ -39,3 +39,5 @@ ENV/
 
 # Miscellaneous
 .DS_Store
+
+uv.lock

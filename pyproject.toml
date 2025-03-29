@@ -7,9 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]",
     "azure-mgmt-resource",
+    "azure-mgmt-compute",
+    "azure-mgmt-network",
     "azure-identity",
     "python-dotenv",
     "pyproject-toml>=0.1.0",
+    "paramiko>=3.4.0",
 ]
 
 [project.optional-dependencies]
