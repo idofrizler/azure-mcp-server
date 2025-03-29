@@ -734,6 +734,293 @@ async def run_vm_commands(
         'hostname': public_ip.ip_address
     }
 
+@mcp.tool(description="Creates an Application Gateway with WAF and configures backend pools.")
+async def create_app_gateway_with_waf(
+    resource_group: str,
+    app_gateway_name: str,
+    backend_pool_name: str,
+    backend_fqdns: List[str] = None,
+    backend_ips: List[str] = None,
+    location: str = "westeurope",
+    sku_name: str = "WAF_v2",
+    capacity: int = 2,
+    waf_enabled: bool = True,
+    waf_mode: str = "Prevention",
+    frontend_port: int = 80,
+    backend_port: int = 80,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create an Application Gateway with WAF and configure backend pools.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name for the Application Gateway
+        backend_pool_name: Name for the backend pool
+        backend_fqdns: List of backend FQDNs (optional)
+        backend_ips: List of backend IP addresses (optional)
+        location: Azure region for the Application Gateway
+        sku_name: SKU name (WAF_v2 recommended for WAF)
+        capacity: Number of Application Gateway instances
+        waf_enabled: Whether to enable WAF
+        waf_mode: WAF mode (Detection or Prevention)
+        frontend_port: Frontend port number
+        backend_port: Backend port number
+        tags: Optional tags for the Application Gateway
+    
+    Returns:
+        Dictionary containing the Application Gateway details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    if not backend_fqdns and not backend_ips:
+        raise ValueError("Either backend_fqdns or backend_ips must be provided")
+
+    network_client = get_network_client()
+
+    # Create public IP for the Application Gateway
+    public_ip_name = f"{app_gateway_name}-pip"
+    public_ip_params = {
+        'location': location,
+        'sku': {
+            'name': 'Standard'
+        },
+        'public_ip_allocation_method': 'Static',
+        'public_ip_address_version': 'IPV4'
+    }
+    
+    public_ip = network_client.public_ip_addresses.begin_create_or_update(
+        resource_group,
+        public_ip_name,
+        public_ip_params
+    ).result()
+
+    # Create VNet and subnet for the Application Gateway
+    vnet_name = f"{app_gateway_name}-vnet"
+    subnet_name = "appgw-subnet"
+    
+    vnet_params = {
+        'location': location,
+        'address_space': {
+            'address_prefixes': ['10.0.0.0/16']
+        },
+        'subnets': [{
+            'name': subnet_name,
+            'address_prefix': '10.0.0.0/24'
+        }]
+    }
+    
+    vnet = network_client.virtual_networks.begin_create_or_update(
+        resource_group,
+        vnet_name,
+        vnet_params
+    ).result()
+
+    subnet = vnet.subnets[0]
+
+    # Prepare backend pool configuration
+    backend_addresses = []
+    if backend_fqdns:
+        backend_addresses.extend([{'fqdn': fqdn} for fqdn in backend_fqdns])
+    if backend_ips:
+        backend_addresses.extend([{'ip_address': ip} for ip in backend_ips])
+
+    # Create Application Gateway parameters
+    app_gateway_params = {
+        'location': location,
+        'tags': tags or {},
+        'sku': {
+            'name': sku_name,
+            'tier': 'WAF_v2',
+            'capacity': capacity
+        },
+        'gateway_ip_configurations': [{
+            'name': 'appGatewayIpConfig',
+            'subnet': {
+                'id': subnet.id
+            }
+        }],
+        'frontend_ip_configurations': [{
+            'name': 'appGwPublicFrontendIp',
+            'public_ip_address': {
+                'id': public_ip.id
+            }
+        }],
+        'frontend_ports': [{
+            'name': 'appGwFrontendPort',
+            'port': frontend_port
+        }],
+        'backend_address_pools': [{
+            'name': backend_pool_name,
+            'backend_addresses': backend_addresses
+        }],
+        'backend_http_settings_collection': [{
+            'name': 'appGwBackendHttpSettings',
+            'port': backend_port,
+            'protocol': 'Http',
+            'cookie_based_affinity': 'Disabled',
+            'request_timeout': 30,
+            'probe': None  # Remove the probe for now to simplify configuration
+        }],
+        'http_listeners': [{
+            'name': 'appGwHttpListener',
+            'frontend_ip_configuration': {
+                'id': f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Network/applicationGateways/{app_gateway_name}/frontendIPConfigurations/appGwPublicFrontendIp"
+            },
+            'frontend_port': {
+                'id': f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Network/applicationGateways/{app_gateway_name}/frontendPorts/appGwFrontendPort"
+            },
+            'protocol': 'Http'
+        }],
+        'request_routing_rules': [{
+            'name': 'rule1',
+            'rule_type': 'Basic',
+            'priority': 100,
+            'http_listener': {
+                'id': f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Network/applicationGateways/{app_gateway_name}/httpListeners/appGwHttpListener"
+            },
+            'backend_address_pool': {
+                'id': f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Network/applicationGateways/{app_gateway_name}/backendAddressPools/{backend_pool_name}"
+            },
+            'backend_http_settings': {
+                'id': f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Network/applicationGateways/{app_gateway_name}/backendHttpSettingsCollection/appGwBackendHttpSettings"
+            }
+        }],
+        'web_application_firewall_configuration': {
+            'enabled': waf_enabled,
+            'firewall_mode': waf_mode,
+            'rule_set_type': 'OWASP',
+            'rule_set_version': '3.2',
+            'file_upload_limit_mb': 100,
+            'request_body_check': True,
+            'max_request_body_size_kb': 128
+        } if waf_enabled else None
+    }
+
+    # Create the Application Gateway
+    app_gateway = network_client.application_gateways.begin_create_or_update(
+        resource_group,
+        app_gateway_name,
+        app_gateway_params
+    ).result()
+
+    return {
+        'id': app_gateway.id,
+        'name': app_gateway.name,
+        'public_ip': public_ip.ip_address,
+        'backend_pool': {
+            'name': backend_pool_name,
+            'addresses': backend_addresses
+        },
+        'waf_enabled': waf_enabled,
+        'waf_mode': waf_mode if waf_enabled else None,
+        'provisioning_state': app_gateway.provisioning_state
+    }
+
+@mcp.tool(description="Creates or updates a custom WAF rule in an Application Gateway.")
+async def create_app_gateway_waf_rule(
+    resource_group: str,
+    app_gateway_name: str,
+    rule_name: str,
+    priority: int,
+    rule_type: str = "MatchRule",
+    action: str = "Block",
+    match_conditions: List[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Create or update a custom WAF rule in an Application Gateway.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        rule_name: Name for the custom rule
+        priority: Rule priority (1-100)
+        rule_type: Rule type (default: MatchRule)
+        action: Action to take (Allow/Block/Log)
+        match_conditions: List of match conditions, each containing:
+            - match_variables: List of variables to match (Headers, QueryString, etc.)
+            - operator: Operator for matching (Contains, Equals, etc.)
+            - match_values: Values to match against
+            - transforms: Optional transformations to apply
+    
+    Returns:
+        Dictionary containing the updated WAF policy details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get the existing Application Gateway
+    app_gateway = network_client.application_gateways.get(
+        resource_group,
+        app_gateway_name
+    )
+
+    # Prepare the custom rules
+    custom_rules = []
+    if app_gateway.web_application_firewall_configuration and hasattr(app_gateway.web_application_firewall_configuration, 'custom_rules'):
+        custom_rules.extend(app_gateway.web_application_firewall_configuration.custom_rules or [])
+
+    # Create or update the new rule
+    new_rule = {
+        'name': rule_name,
+        'priority': priority,
+        'rule_type': rule_type,
+        'match_conditions': match_conditions or [],
+        'action': action
+    }
+
+    # Update existing rule or add new one
+    rule_updated = False
+    for i, rule in enumerate(custom_rules):
+        if rule.name == rule_name:
+            custom_rules[i] = new_rule
+            rule_updated = True
+            break
+    
+    if not rule_updated:
+        custom_rules.append(new_rule)
+
+    # Update the WAF configuration
+    waf_config = app_gateway.web_application_firewall_configuration
+    waf_config['custom_rules'] = custom_rules
+
+    # Update the Application Gateway
+    app_gateway_params = {
+        'location': app_gateway.location,
+        'sku': app_gateway.sku,
+        'gateway_ip_configurations': app_gateway.gateway_ip_configurations,
+        'frontend_ip_configurations': app_gateway.frontend_ip_configurations,
+        'frontend_ports': app_gateway.frontend_ports,
+        'backend_address_pools': app_gateway.backend_address_pools,
+        'backend_http_settings_collection': app_gateway.backend_http_settings_collection,
+        'http_listeners': app_gateway.http_listeners,
+        'request_routing_rules': app_gateway.request_routing_rules,
+        'web_application_firewall_configuration': waf_config
+    }
+
+    # Apply the update
+    updated_gateway = network_client.application_gateways.begin_create_or_update(
+        resource_group,
+        app_gateway_name,
+        app_gateway_params
+    ).result()
+
+    return {
+        'id': updated_gateway.id,
+        'name': updated_gateway.name,
+        'custom_rules': [
+            {
+                'name': rule.name,
+                'priority': rule.priority,
+                'rule_type': rule.rule_type,
+                'action': rule.action,
+                'match_conditions': rule.match_conditions
+            }
+            for rule in updated_gateway.web_application_firewall_configuration.custom_rules or []
+        ] if updated_gateway.web_application_firewall_configuration else []
+    }
+
 if __name__ == "__main__":
     print(f"Starting Azure Resource MCP Server...")
     mcp.run()
