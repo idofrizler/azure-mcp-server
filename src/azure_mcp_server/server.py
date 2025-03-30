@@ -10,6 +10,7 @@ from azure.identity import DeviceCodeCredential, DefaultAzureCredential, ClientS
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.sql import SqlManagementClient
 
 dotenv.load_dotenv()
 mcp = FastMCP("Azure Resource MCP")
@@ -80,6 +81,24 @@ def get_network_client() -> NetworkManagementClient:
         credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
     
     return NetworkManagementClient(
+        credential=credential,
+        subscription_id=config.subscription_id
+    )
+
+def get_sql_client() -> SqlManagementClient:
+    """Get an Azure SQL Management client using appropriate authentication."""
+    if config.client_id and config.client_secret and config.tenant_id:
+        credential = ClientSecretCredential(
+            tenant_id=config.tenant_id,
+            client_id=config.client_id,
+            client_secret=config.client_secret
+        )
+    elif config.tenant_id:
+        credential = DeviceCodeCredential(tenant_id=config.tenant_id)
+    else:
+        credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+    
+    return SqlManagementClient(
         credential=credential,
         subscription_id=config.subscription_id
     )
@@ -1054,6 +1073,170 @@ async def delete_resource_group(
             'status': 'error',
             'message': str(e)
         }
+
+@mcp.tool(description="Creates a new Azure SQL Server with optional firewall rules.")
+async def create_sql_server(
+    resource_group: str,
+    server_name: str,
+    location: str = "westeurope",
+    admin_login: str = "sqladmin",
+    allow_azure_services: bool = True,
+    allow_all_ips: bool = False,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create a new Azure SQL Server.
+    
+    Args:
+        resource_group: Name of the resource group
+        server_name: Name for the SQL server (must be globally unique)
+        location: Azure region for the server
+        admin_login: Administrator login name
+        allow_azure_services: Whether to allow Azure services to access the server
+        allow_all_ips: Whether to allow access from any IP (0.0.0.0-255.255.255.255)
+        tags: Optional tags for the server
+    
+    Returns:
+        Dictionary containing the created SQL server's details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    sql_client = get_sql_client()
+
+    # Generate a strong random password
+    import secrets
+    import string
+    password_chars = string.ascii_letters + string.digits + "!@#$%^&*"
+    admin_password = ''.join(secrets.choice(password_chars) for _ in range(16))
+
+    # Create server parameters
+    parameters = {
+        'location': location,
+        'properties': {
+            'administrator_login': admin_login,
+            'administrator_login_password': admin_password,
+            'version': '12.0',  # Latest version
+            'minimal_tls_version': '1.2',  # Enforce TLS 1.2
+            'public_network_access': 'Enabled'
+        },
+        'tags': tags or {}
+    }
+
+    # Create the server
+    server = sql_client.servers.begin_create_or_update(
+        resource_group,
+        server_name,
+        parameters
+    ).result()
+
+    # Add firewall rules if requested
+    firewall_rules = []
+    
+    if allow_azure_services:
+        # Allow Azure services rule
+        azure_services_rule = sql_client.firewall_rules.create_or_update(
+            resource_group,
+            server_name,
+            "AllowAllWindowsAzureIps",
+            {
+                'start_ip_address': '0.0.0.0',
+                'end_ip_address': '0.0.0.0'
+            }
+        )
+        firewall_rules.append(azure_services_rule)
+
+    if allow_all_ips:
+        # Allow all IPs rule
+        all_ips_rule = sql_client.firewall_rules.create_or_update(
+            resource_group,
+            server_name,
+            "AllowAllIPs",
+            {
+                'start_ip_address': '0.0.0.0',
+                'end_ip_address': '255.255.255.255'
+            }
+        )
+        firewall_rules.append(all_ips_rule)
+
+    return {
+        'id': server.id,
+        'name': server.name,
+        'location': server.location,
+        'fully_qualified_domain_name': server.fully_qualified_domain_name,
+        'admin_login': admin_login,
+        'admin_password': admin_password,  # Return the generated password
+        'firewall_rules': [
+            {
+                'name': rule.name,
+                'start_ip_address': rule.start_ip_address,
+                'end_ip_address': rule.end_ip_address
+            }
+            for rule in firewall_rules
+        ]
+    }
+
+@mcp.tool(description="Creates a new database in an existing Azure SQL Server.")
+async def create_sql_database(
+    resource_group: str,
+    server_name: str,
+    database_name: str,
+    location: str = "westeurope",
+    sku_name: str = "Basic",
+    max_size_bytes: int = 2147483648,  # 2GB
+    zone_redundant: bool = False,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create a new database in an Azure SQL Server.
+    
+    Args:
+        resource_group: Name of the resource group
+        server_name: Name of the existing SQL server
+        database_name: Name for the new database
+        location: Azure region for the database
+        sku_name: Performance tier (Basic, Standard, Premium)
+        max_size_bytes: Maximum size of the database in bytes
+        zone_redundant: Whether to enable zone redundancy
+        tags: Optional tags for the database
+    
+    Returns:
+        Dictionary containing the created database's details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    sql_client = get_sql_client()
+
+    # Create database parameters
+    parameters = {
+        'location': location,
+        'sku': {
+            'name': sku_name
+        },
+        'max_size_bytes': max_size_bytes,
+        'zone_redundant': zone_redundant,
+        'tags': tags or {}
+    }
+
+    # Create the database
+    database = sql_client.databases.begin_create_or_update(
+        resource_group,
+        server_name,
+        database_name,
+        parameters
+    ).result()
+
+    return {
+        'id': database.id,
+        'name': database.name,
+        'location': database.location,
+        'status': database.status,
+        'max_size_bytes': database.max_size_bytes,
+        'sku': {
+            'name': database.sku.name,
+            'tier': database.sku.tier,
+            'capacity': database.sku.capacity
+        } if database.sku else None
+    }
 
 if __name__ == "__main__":
     print(f"Starting Azure Resource MCP Server...")
