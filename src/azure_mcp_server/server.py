@@ -11,6 +11,7 @@ from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.sql import SqlManagementClient
+from azure.mgmt.containerregistry import ContainerRegistryManagementClient
 
 dotenv.load_dotenv()
 mcp = FastMCP("Azure Resource MCP")
@@ -99,6 +100,24 @@ def get_sql_client() -> SqlManagementClient:
         credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
     
     return SqlManagementClient(
+        credential=credential,
+        subscription_id=config.subscription_id
+    )
+
+def get_container_registry_client() -> ContainerRegistryManagementClient:
+    """Get an Azure Container Registry Management client using appropriate authentication."""
+    if config.client_id and config.client_secret and config.tenant_id:
+        credential = ClientSecretCredential(
+            tenant_id=config.tenant_id,
+            client_id=config.client_id,
+            client_secret=config.client_secret
+        )
+    elif config.tenant_id:
+        credential = DeviceCodeCredential(tenant_id=config.tenant_id)
+    else:
+        credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+    
+    return ContainerRegistryManagementClient(
         credential=credential,
         subscription_id=config.subscription_id
     )
@@ -1236,6 +1255,750 @@ async def create_sql_database(
             'tier': database.sku.tier,
             'capacity': database.sku.capacity
         } if database.sku else None
+    }
+
+@mcp.tool(description="Creates a new Azure Container Registry.")
+async def create_acr(
+    resource_group: str,
+    name: str,
+    location: str = "westeurope",
+    sku: str = "Basic",
+    admin_enabled: bool = True,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create a new Azure Container Registry.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name for the new registry (must be globally unique)
+        location: Azure region for the registry
+        sku: SKU name ('Basic', 'Standard', or 'Premium')
+        admin_enabled: Whether to enable admin user
+        tags: Optional tags for the registry
+    
+    Returns:
+        Dictionary containing the created registry's details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    client = get_container_registry_client()
+    
+    registry_parameters = {
+        'location': location,
+        'sku': {'name': sku},
+        'admin_user_enabled': admin_enabled,
+        'tags': tags or {}
+    }
+    
+    poller = client.registries.begin_create(
+        resource_group,
+        name,
+        registry_parameters
+    )
+    registry = poller.result()
+    
+    return {
+        'id': registry.id,
+        'name': registry.name,
+        'location': registry.location,
+        'login_server': registry.login_server,
+        'admin_enabled': registry.admin_user_enabled,
+        'sku': registry.sku.name
+    }
+
+@mcp.tool(description="Gets the login credentials for an Azure Container Registry.")
+async def get_acr_credentials(
+    resource_group: str,
+    name: str
+) -> Dict[str, Any]:
+    """Get login credentials for an Azure Container Registry.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the registry
+    
+    Returns:
+        Dictionary containing the registry credentials
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    client = get_container_registry_client()
+    credentials = client.registries.list_credentials(resource_group, name)
+    
+    return {
+        'username': credentials.username,
+        'passwords': [
+            {'name': pwd.name, 'value': pwd.value}
+            for pwd in credentials.passwords
+        ] if credentials.passwords else []
+    }
+
+@mcp.tool(description="Lists repositories in an Azure Container Registry.")
+async def list_acr_repositories(
+    resource_group: str,
+    name: str
+) -> List[str]:
+    """List repositories in an Azure Container Registry.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the registry
+    
+    Returns:
+        List of repository names
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    client = get_container_registry_client()
+    result = client.registries.list_repositories(resource_group, name)
+    
+    return result.repositories if result.repositories else []
+
+@mcp.tool(description="Lists tags for a repository in an Azure Container Registry.")
+async def list_acr_tags(
+    resource_group: str,
+    name: str,
+    repository: str
+) -> List[str]:
+    """List tags for a repository in an Azure Container Registry.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the registry
+        repository: Name of the repository
+    
+    Returns:
+        List of tag names
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    client = get_container_registry_client()
+    result = client.registries.list_tags(resource_group, name, repository)
+    
+    return [tag.name for tag in result.tags] if result.tags else []
+
+@mcp.tool(description="Updates an existing Application Gateway's backend pool configuration.")
+async def update_app_gateway_backend_pool(
+    resource_group: str,
+    app_gateway_name: str,
+    backend_pool_name: str,
+    backend_fqdns: List[str] = None,
+    backend_ips: List[str] = None,
+    backend_port: int = 80
+) -> Dict[str, Any]:
+    """Update an existing Application Gateway's backend pool configuration.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        backend_pool_name: Name of the backend pool to update or create
+        backend_fqdns: List of backend FQDNs (optional)
+        backend_ips: List of backend IP addresses (optional)
+        backend_port: Backend port number
+    
+    Returns:
+        Dictionary containing the updated Application Gateway details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    if not backend_fqdns and not backend_ips:
+        raise ValueError("Either backend_fqdns or backend_ips must be provided")
+
+    network_client = get_network_client()
+
+    # Get the existing Application Gateway
+    app_gateway = network_client.application_gateways.get(
+        resource_group,
+        app_gateway_name
+    )
+
+    # Convert the app gateway to a dict for modification
+    app_gateway_dict = app_gateway.as_dict()
+
+    # Prepare backend addresses
+    backend_addresses = []
+    if backend_fqdns:
+        backend_addresses.extend([{'fqdn': fqdn} for fqdn in backend_fqdns])
+    if backend_ips:
+        backend_addresses.extend([{'ip_address': ip} for ip in backend_ips])
+
+    # Find or create backend pool
+    backend_pool_found = False
+    for pool in app_gateway_dict['backend_address_pools']:
+        if pool['name'] == backend_pool_name:
+            pool['backend_addresses'] = backend_addresses
+            backend_pool_found = True
+            break
+    
+    if not backend_pool_found:
+        if 'backend_address_pools' not in app_gateway_dict:
+            app_gateway_dict['backend_address_pools'] = []
+        app_gateway_dict['backend_address_pools'].append({
+            'name': backend_pool_name,
+            'backend_addresses': backend_addresses
+        })
+
+    # Update backend HTTP settings if needed
+    settings_name = f"{backend_pool_name}-http-settings"
+    settings_found = False
+    for setting in app_gateway_dict['backend_http_settings_collection']:
+        if setting['name'] == settings_name:
+            setting['port'] = backend_port
+            settings_found = True
+            break
+    
+    if not settings_found:
+        if 'backend_http_settings_collection' not in app_gateway_dict:
+            app_gateway_dict['backend_http_settings_collection'] = []
+        app_gateway_dict['backend_http_settings_collection'].append({
+            'name': settings_name,
+            'port': backend_port,
+            'protocol': 'Http',
+            'cookie_based_affinity': 'Disabled',
+            'request_timeout': 30,
+            'probe': None
+        })
+
+    # Update the first routing rule to use our backend pool
+    if app_gateway_dict['request_routing_rules']:
+        rule = app_gateway_dict['request_routing_rules'][0]
+        rule['backend_address_pool'] = {
+            'id': f"{app_gateway_dict['id']}/backendAddressPools/{backend_pool_name}"
+        }
+        rule['backend_http_settings'] = {
+            'id': f"{app_gateway_dict['id']}/backendHttpSettingsCollection/{settings_name}"
+        }
+    else:
+        # Create a new rule if none exist
+        app_gateway_dict['request_routing_rules'] = [{
+            'name': 'rule1',
+            'rule_type': 'Basic',
+            'priority': 100,
+            'http_listener': {
+                'id': app_gateway_dict['http_listeners'][0]['id']
+            },
+            'backend_address_pool': {
+                'id': f"{app_gateway_dict['id']}/backendAddressPools/{backend_pool_name}"
+            },
+            'backend_http_settings': {
+                'id': f"{app_gateway_dict['id']}/backendHttpSettingsCollection/{settings_name}"
+            }
+        }]
+
+    # Update the Application Gateway
+    updated_gateway = network_client.application_gateways.begin_create_or_update(
+        resource_group,
+        app_gateway_name,
+        app_gateway_dict
+    ).result()
+
+    return {
+        'id': updated_gateway.id,
+        'name': updated_gateway.name,
+        'backend_pools': [
+            {
+                'name': pool.name,
+                'addresses': [
+                    {'fqdn': addr.fqdn} if addr.fqdn else {'ip_address': addr.ip_address}
+                    for addr in pool.backend_addresses
+                ] if pool.backend_addresses else []
+            }
+            for pool in updated_gateway.backend_address_pools
+        ],
+        'provisioning_state': updated_gateway.provisioning_state
+    }
+
+@mcp.tool(description="Gets detailed information about an Application Gateway including its public IP, listeners, rules, and backend configuration.")
+async def get_app_gateway_info(
+    resource_group: str,
+    app_gateway_name: str
+) -> Dict[str, Any]:
+    """Get detailed information about an Application Gateway.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+    
+    Returns:
+        Dictionary containing detailed Application Gateway information
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get the Application Gateway
+    app_gateway = network_client.application_gateways.get(
+        resource_group,
+        app_gateway_name
+    )
+
+    # Get the public IP
+    public_ip = None
+    if app_gateway.frontend_ip_configurations:
+        for frontend_ip in app_gateway.frontend_ip_configurations:
+            if frontend_ip.public_ip_address:
+                public_ip_id = frontend_ip.public_ip_address.id
+                public_ip_name = public_ip_id.split('/')[-1]
+                public_ip = network_client.public_ip_addresses.get(
+                    resource_group,
+                    public_ip_name
+                )
+                break
+
+    # Build the response
+    return {
+        'id': app_gateway.id,
+        'name': app_gateway.name,
+        'location': app_gateway.location,
+        'public_ip': public_ip.ip_address if public_ip else None,
+        'operational_state': app_gateway.operational_state,
+        'sku': {
+            'name': app_gateway.sku.name,
+            'tier': app_gateway.sku.tier,
+            'capacity': app_gateway.sku.capacity
+        },
+        'frontend_ports': [
+            {
+                'name': port.name,
+                'port': port.port
+            }
+            for port in app_gateway.frontend_ports
+        ],
+        'backend_pools': [
+            {
+                'name': pool.name,
+                'addresses': [
+                    {
+                        'fqdn': addr.fqdn,
+                        'ip_address': addr.ip_address
+                    }
+                    for addr in pool.backend_addresses
+                ] if pool.backend_addresses else []
+            }
+            for pool in app_gateway.backend_address_pools
+        ],
+        'http_settings': [
+            {
+                'name': setting.name,
+                'port': setting.port,
+                'protocol': setting.protocol,
+                'cookie_based_affinity': setting.cookie_based_affinity,
+                'request_timeout': setting.request_timeout
+            }
+            for setting in app_gateway.backend_http_settings_collection
+        ],
+        'routing_rules': [
+            {
+                'name': rule.name,
+                'rule_type': rule.rule_type,
+                'priority': rule.priority,
+                'backend_pool': rule.backend_address_pool.id.split('/')[-1] if rule.backend_address_pool else None,
+                'backend_http_settings': rule.backend_http_settings.id.split('/')[-1] if rule.backend_http_settings else None,
+                'http_listener': rule.http_listener.id.split('/')[-1] if rule.http_listener else None
+            }
+            for rule in app_gateway.request_routing_rules
+        ],
+        'waf_configuration': {
+            'enabled': app_gateway.web_application_firewall_configuration.enabled,
+            'firewall_mode': app_gateway.web_application_firewall_configuration.firewall_mode,
+            'rule_set_type': app_gateway.web_application_firewall_configuration.rule_set_type,
+            'rule_set_version': app_gateway.web_application_firewall_configuration.rule_set_version
+        } if app_gateway.web_application_firewall_configuration else None,
+        'ssl_certificates': [
+            {
+                'name': cert.name,
+                'public_cert_data': cert.public_cert_data
+            }
+            for cert in app_gateway.ssl_certificates
+        ] if app_gateway.ssl_certificates else [],
+        'provisioning_state': app_gateway.provisioning_state
+    }
+
+@mcp.tool(description="Updates WAF configuration on an Application Gateway.")
+async def update_app_gateway_waf_config(
+    resource_group: str,
+    app_gateway_name: str,
+    enabled: bool = True,
+    firewall_mode: str = "Detection",
+    rule_set_type: str = "OWASP",
+    rule_set_version: str = "3.2"
+) -> Dict[str, Any]:
+    """Update WAF configuration on an Application Gateway.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        enabled: Whether WAF is enabled
+        firewall_mode: WAF mode (Detection or Prevention)
+        rule_set_type: Rule set type (OWASP)
+        rule_set_version: Rule set version
+    
+    Returns:
+        Dictionary containing the updated Application Gateway details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get the Application Gateway
+    app_gateway = network_client.application_gateways.get(
+        resource_group,
+        app_gateway_name
+    )
+
+    # Convert to dict for modification
+    app_gateway_dict = app_gateway.as_dict()
+
+    # Update WAF configuration
+    app_gateway_dict['web_application_firewall_configuration'] = {
+        'enabled': enabled,
+        'firewall_mode': firewall_mode,
+        'rule_set_type': rule_set_type,
+        'rule_set_version': rule_set_version,
+        'file_upload_limit_mb': 100,
+        'request_body_check': True,
+        'max_request_body_size_kb': 128
+    }
+
+    # Update the Application Gateway
+    updated_gateway = network_client.application_gateways.begin_create_or_update(
+        resource_group,
+        app_gateway_name,
+        app_gateway_dict
+    ).result()
+
+    return {
+        'id': updated_gateway.id,
+        'name': updated_gateway.name,
+        'waf_configuration': {
+            'enabled': updated_gateway.web_application_firewall_configuration.enabled,
+            'firewall_mode': updated_gateway.web_application_firewall_configuration.firewall_mode,
+            'rule_set_type': updated_gateway.web_application_firewall_configuration.rule_set_type,
+            'rule_set_version': updated_gateway.web_application_firewall_configuration.rule_set_version
+        } if updated_gateway.web_application_firewall_configuration else None,
+        'provisioning_state': updated_gateway.provisioning_state
+    }
+
+@mcp.tool(description="Gets detailed information about a Network Security Group including all its rules.")
+async def get_nsg_info(
+    resource_group: str,
+    nsg_name: str
+) -> Dict[str, Any]:
+    """Get detailed information about a Network Security Group.
+    
+    Args:
+        resource_group: Name of the resource group
+        nsg_name: Name of the NSG
+    
+    Returns:
+        Dictionary containing detailed NSG information including all rules
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get the NSG
+    nsg = network_client.network_security_groups.get(
+        resource_group,
+        nsg_name
+    )
+
+    # Build the response
+    return {
+        'id': nsg.id,
+        'name': nsg.name,
+        'location': nsg.location,
+        'security_rules': [
+            {
+                'name': rule.name,
+                'protocol': rule.protocol,
+                'source_address_prefix': rule.source_address_prefix,
+                'source_port_range': rule.source_port_range,
+                'destination_address_prefix': rule.destination_address_prefix,
+                'destination_port_range': rule.destination_port_range,
+                'access': rule.access,
+                'priority': rule.priority,
+                'direction': rule.direction,
+                'provisioning_state': rule.provisioning_state
+            }
+            for rule in nsg.security_rules or []
+        ],
+        'default_security_rules': [
+            {
+                'name': rule.name,
+                'protocol': rule.protocol,
+                'source_address_prefix': rule.source_address_prefix,
+                'source_port_range': rule.source_port_range,
+                'destination_address_prefix': rule.destination_address_prefix,
+                'destination_port_range': rule.destination_port_range,
+                'access': rule.access,
+                'priority': rule.priority,
+                'direction': rule.direction,
+                'provisioning_state': rule.provisioning_state
+            }
+            for rule in nsg.default_security_rules or []
+        ],
+        'network_interfaces': [
+            {
+                'id': nic.id,
+                'name': nic.id.split('/')[-1]
+            }
+            for nic in nsg.network_interfaces or []
+        ] if nsg.network_interfaces else [],
+        'provisioning_state': nsg.provisioning_state
+    }
+
+@mcp.tool(description="Creates VNet peering between two virtual networks.")
+async def create_vnet_peering(
+    resource_group: str,
+    vnet1_name: str,
+    vnet2_name: str,
+    allow_forwarded_traffic: bool = True,
+    allow_gateway_transit: bool = False,
+    use_remote_gateways: bool = False
+) -> Dict[str, Any]:
+    """Create VNet peering between two virtual networks.
+    
+    Args:
+        resource_group: Name of the resource group
+        vnet1_name: Name of the first VNet
+        vnet2_name: Name of the second VNet
+        allow_forwarded_traffic: Whether to allow forwarded traffic
+        allow_gateway_transit: Whether to allow gateway transit
+        use_remote_gateways: Whether to use remote gateways
+    
+    Returns:
+        Dictionary containing the peering details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get both VNets
+    vnet1 = network_client.virtual_networks.get(resource_group, vnet1_name)
+    vnet2 = network_client.virtual_networks.get(resource_group, vnet2_name)
+
+    # Create peering from vnet1 to vnet2
+    peering1_name = f"{vnet1_name}-to-{vnet2_name}"
+    peering1_params = {
+        'remote_virtual_network': {
+            'id': vnet2.id
+        },
+        'allow_virtual_network_access': True,
+        'allow_forwarded_traffic': allow_forwarded_traffic,
+        'allow_gateway_transit': allow_gateway_transit,
+        'use_remote_gateways': use_remote_gateways
+    }
+    
+    peering1 = network_client.virtual_network_peerings.begin_create_or_update(
+        resource_group,
+        vnet1_name,
+        peering1_name,
+        peering1_params
+    ).result()
+
+    # Create peering from vnet2 to vnet1
+    peering2_name = f"{vnet2_name}-to-{vnet1_name}"
+    peering2_params = {
+        'remote_virtual_network': {
+            'id': vnet1.id
+        },
+        'allow_virtual_network_access': True,
+        'allow_forwarded_traffic': allow_forwarded_traffic,
+        'allow_gateway_transit': allow_gateway_transit,
+        'use_remote_gateways': use_remote_gateways
+    }
+    
+    peering2 = network_client.virtual_network_peerings.begin_create_or_update(
+        resource_group,
+        vnet2_name,
+        peering2_name,
+        peering2_params
+    ).result()
+
+    return {
+        'peering1': {
+            'name': peering1.name,
+            'state': peering1.peering_state,
+            'remote_vnet': vnet2.name
+        },
+        'peering2': {
+            'name': peering2.name,
+            'state': peering2.peering_state,
+            'remote_vnet': vnet1.name
+        }
+    }
+
+@mcp.tool(description="Deletes a specific Azure resource by its type and name.")
+async def delete_resource(
+    resource_group: str,
+    resource_type: str,
+    resource_name: str
+) -> Dict[str, Any]:
+    """Delete a specific Azure resource.
+    
+    Args:
+        resource_group: Name of the resource group
+        resource_type: Type of resource (e.g., 'Microsoft.Network/applicationGateways')
+        resource_name: Name of the resource
+    
+    Returns:
+        Dictionary containing the deletion operation status
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    client = get_resource_client()
+    
+    try:
+        # Begin the deletion operation
+        deletion_poller = client.resources.begin_delete_by_id(
+            resource_id=f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/{resource_type}/{resource_name}",
+            api_version="2021-04-01"
+        )
+        # Wait for the deletion to complete
+        deletion_result = deletion_poller.result()
+        
+        return {
+            'status': 'success',
+            'message': f"Resource {resource_name} of type {resource_type} has been deleted",
+            'result': deletion_result
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+@mcp.tool(description="Manages health probes for an Application Gateway and retrieves backend health status.")
+async def manage_app_gateway_health(
+    resource_group: str,
+    app_gateway_name: str,
+    probe_name: str = "default-probe",
+    host: str = None,
+    path: str = "/",
+    interval: int = 30,
+    timeout: int = 30,
+    unhealthy_threshold: int = 3,
+    protocol: str = "Http",
+    port: int = None,
+    match_status_codes: List[str] = ["200-399"]
+) -> Dict[str, Any]:
+    """Manages health probes for an Application Gateway and retrieves backend health.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        probe_name: Name for the health probe
+        host: Host header to be used for the probe
+        path: Path to probe on the backend
+        interval: Probe interval in seconds
+        timeout: Probe timeout in seconds
+        unhealthy_threshold: Number of failed probes before marking as unhealthy
+        protocol: Protocol to use for the probe (Http/Https)
+        port: Port to probe (if different from backend http settings)
+        match_status_codes: List of status codes or ranges considered healthy
+    
+    Returns:
+        Dictionary containing probe configuration and backend health status
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+
+    # Get the Application Gateway
+    app_gateway = network_client.application_gateways.get(
+        resource_group,
+        app_gateway_name
+    )
+
+    # Convert to dict for modification
+    app_gateway_dict = app_gateway.as_dict()
+
+    # Create or update probe configuration
+    probe_config = {
+        'name': probe_name,
+        'protocol': protocol,
+        'host': host,
+        'path': path,
+        'interval': interval,
+        'timeout': timeout,
+        'unhealthy_threshold': unhealthy_threshold,
+        'match': {
+            'status_codes': match_status_codes
+        }
+    }
+    if port:
+        probe_config['port'] = port
+
+    # Update or add probe
+    probe_found = False
+    if 'probes' in app_gateway_dict:
+        for i, probe in enumerate(app_gateway_dict['probes']):
+            if probe['name'] == probe_name:
+                app_gateway_dict['probes'][i] = probe_config
+                probe_found = True
+                break
+    else:
+        app_gateway_dict['probes'] = []
+    
+    if not probe_found:
+        app_gateway_dict['probes'].append(probe_config)
+
+    # Update backend http settings to use the probe
+    for setting in app_gateway_dict['backend_http_settings_collection']:
+        setting['probe'] = {
+            'id': f"{app_gateway_dict['id']}/probes/{probe_name}"
+        }
+
+    # Update the Application Gateway
+    updated_gateway = network_client.application_gateways.begin_create_or_update(
+        resource_group,
+        app_gateway_name,
+        app_gateway_dict
+    ).result()
+
+    # Get backend health after update
+    backend_health = network_client.application_gateways.begin_backend_health(
+        resource_group,
+        app_gateway_name
+    ).result()
+
+    # Process backend health information
+    health_info = []
+    for pool in backend_health.backend_address_pools:
+        for backend in pool.backends:
+            health_info.append({
+                'address': backend.address,
+                'health_probe_log': backend.health_probe_log,
+                'health': backend.health,
+                'backend_pool': pool.backend_address_pool.name
+            })
+
+    return {
+        'probe_configuration': {
+            'name': probe_name,
+            'protocol': protocol,
+            'host': host,
+            'path': path,
+            'interval': interval,
+            'timeout': timeout,
+            'unhealthy_threshold': unhealthy_threshold,
+            'match_status_codes': match_status_codes,
+            'port': port
+        },
+        'backend_health': health_info,
+        'provisioning_state': updated_gateway.provisioning_state
     }
 
 if __name__ == "__main__":
