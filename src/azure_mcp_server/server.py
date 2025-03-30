@@ -465,7 +465,7 @@ async def create_or_update_nsg(
         access: Allow or Deny
         priority: Rule priority (100-4096)
         direction: Inbound or Outbound
-        location: Azure region for the NSG
+        location: Azure region for the NSG (default to place it in same region as the resource group)
         tags: Optional tags for the NSG
     
     Returns:
@@ -623,8 +623,8 @@ async def run_vm_commands(
     resource_group: str,
     vm_name: str,
     commands: List[str],
-    username: str = "azureuser",
-    password: str = "",  # Empty string as default instead of None
+    username: str,
+    password: str = "",
     timeout: int = 30,
     use_existing_session: bool = True
 ) -> Dict[str, Any]:
@@ -1020,6 +1020,40 @@ async def create_app_gateway_waf_rule(
             for rule in updated_gateway.web_application_firewall_configuration.custom_rules or []
         ] if updated_gateway.web_application_firewall_configuration else []
     }
+
+@mcp.tool(description="Deletes a resource group and all resources contained within it. This is a destructive operation and cannot be undone.")
+async def delete_resource_group(
+    resource_group: str
+) -> Dict[str, Any]:
+    """Delete a resource group and all its resources.
+    
+    Args:
+        resource_group: Name of the resource group to delete
+    
+    Returns:
+        Dictionary containing the deletion operation status
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+    
+    client = get_resource_client()
+    
+    try:
+        # Begin the deletion operation
+        deletion_poller = client.resource_groups.begin_delete(resource_group)
+        # Wait for the deletion to complete
+        deletion_result = deletion_poller.result()
+        
+        return {
+            'status': 'success',
+            'message': f"Resource group {resource_group} and all its resources have been deleted",
+            'result': deletion_result
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
 
 if __name__ == "__main__":
     print(f"Starting Azure Resource MCP Server...")
