@@ -12,6 +12,9 @@ from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.sql import SqlManagementClient
 from azure.mgmt.containerregistry import ContainerRegistryManagementClient
+from azure.mgmt.web import WebSiteManagementClient
+from azure.mgmt.web.models import SiteConfig
+import base64
 
 dotenv.load_dotenv()
 mcp = FastMCP("Azure Resource MCP")
@@ -118,6 +121,24 @@ def get_container_registry_client() -> ContainerRegistryManagementClient:
         credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
     
     return ContainerRegistryManagementClient(
+        credential=credential,
+        subscription_id=config.subscription_id
+    )
+
+def get_web_client() -> WebSiteManagementClient:
+    """Get an Azure Web App Management client using appropriate authentication."""
+    if config.client_id and config.client_secret and config.tenant_id:
+        credential = ClientSecretCredential(
+            tenant_id=config.tenant_id,
+            client_id=config.client_id,
+            client_secret=config.client_secret
+        )
+    elif config.tenant_id:
+        credential = DeviceCodeCredential(tenant_id=config.tenant_id)
+    else:
+        credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+    
+    return WebSiteManagementClient(
         credential=credential,
         subscription_id=config.subscription_id
     )
@@ -1848,31 +1869,47 @@ async def delete_resource(
     
     Args:
         resource_group: Name of the resource group
-        resource_type: Type of resource (e.g., 'Microsoft.Network/applicationGateways')
+        resource_type: Type of the resource (e.g., 'Microsoft.Web/sites')
         resource_name: Name of the resource
     
     Returns:
-        Dictionary containing the deletion operation status
+        Dictionary containing the deletion status
     """
     if not config.subscription_id:
         raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
 
-    client = get_resource_client()
+    resource_client = get_resource_client()
     
     try:
-        # Begin the deletion operation
-        deletion_poller = client.resources.begin_delete_by_id(
-            resource_id=f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/{resource_type}/{resource_name}",
-            api_version="2021-04-01"
+        # Get the latest API version for the resource type
+        provider = resource_type.split('/')[0]
+        resource_type_path = '/'.join(resource_type.split('/')[1:])
+        
+        provider_obj = resource_client.providers.get(provider)
+        resource_type_info = next(
+            (rt for rt in provider_obj.resource_types 
+             if rt.resource_type.lower() == resource_type_path.lower()),
+            None
         )
-        # Wait for the deletion to complete
-        deletion_result = deletion_poller.result()
+        
+        if not resource_type_info:
+            raise ValueError(f"Resource type {resource_type} not found")
+            
+        api_version = resource_type_info.api_versions[0]  # Use latest API version
+        
+        # Delete the resource
+        poller = resource_client.resources.begin_delete_by_id(
+            resource_id=f"/subscriptions/{config.subscription_id}/resourceGroups/{resource_group}/providers/{resource_type}/{resource_name}",
+            api_version=api_version
+        )
+        
+        result = poller.result()  # Wait for completion
         
         return {
             'status': 'success',
-            'message': f"Resource {resource_name} of type {resource_type} has been deleted",
-            'result': deletion_result
+            'message': f"Resource {resource_name} of type {resource_type} deleted successfully"
         }
+        
     except Exception as e:
         return {
             'status': 'error',
@@ -2000,6 +2037,802 @@ async def manage_app_gateway_health(
         'backend_health': health_info,
         'provisioning_state': updated_gateway.provisioning_state
     }
+
+@mcp.tool(description="Creates an App Service Plan in Azure.")
+async def create_app_service_plan(
+    resource_group: str,
+    name: str,
+    location: str = "westeurope",
+    sku: str = "B1",
+    os_type: str = "Linux",
+    per_site_scaling: bool = False,
+    maximum_elastic_worker_count: int = 1,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create an App Service Plan in Azure.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name for the App Service Plan
+        location: Azure region for the plan
+        sku: SKU name (e.g., B1, S1, P1v2)
+        os_type: Operating system type (Linux or Windows)
+        per_site_scaling: Whether to enable per-site scaling
+        maximum_elastic_worker_count: Maximum number of workers for elastic scaling
+        tags: Optional tags for the plan
+    
+    Returns:
+        Dictionary containing the created App Service Plan details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    # Create App Service Plan parameters
+    plan_parameters = {
+        'location': location,
+        'sku': {
+            'name': sku,
+            'tier': sku[:1],  # First letter indicates tier (B, S, P)
+            'size': sku[1:]  # Rest is the size
+        },
+        'per_site_scaling': per_site_scaling,
+        'maximum_elastic_worker_count': maximum_elastic_worker_count,
+        'reserved': os_type.lower() == 'linux',
+        'tags': tags or {}
+    }
+
+    # Create the App Service Plan
+    plan = web_client.app_service_plans.begin_create_or_update(
+        resource_group,
+        name,
+        plan_parameters
+    ).result()
+
+    return {
+        'id': plan.id,
+        'name': plan.name,
+        'location': plan.location,
+        'sku': {
+            'name': plan.sku.name,
+            'tier': plan.sku.tier,
+            'size': plan.sku.size
+        },
+        'os_type': 'Linux' if plan.reserved else 'Windows',
+        'per_site_scaling': plan.per_site_scaling,
+        'maximum_elastic_worker_count': plan.maximum_elastic_worker_count,
+        'provisioning_state': plan.provisioning_state
+    }
+
+@mcp.tool(description="Creates a new Web App in Azure.")
+async def create_web_app(
+    resource_group: str,
+    name: str,
+    app_service_plan: str,
+    location: str = "westeurope",
+    runtime_stack: str = "python:3.9",
+    os_type: str = "Linux",
+    https_only: bool = True,
+    client_affinity_enabled: bool = False,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Create a new Web App in Azure.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name for the Web App (must be globally unique)
+        app_service_plan: Name of the App Service Plan
+        location: Azure region for the Web App
+        runtime_stack: Runtime stack (e.g., 'python:3.9', 'node:14-lts', 'dotnet:6.0')
+        os_type: Operating system type (Linux or Windows)
+        https_only: Whether to enable HTTPS only
+        client_affinity_enabled: Whether to enable client affinity
+        tags: Optional tags for the Web App
+    
+    Returns:
+        Dictionary containing the created Web App details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    # Get the App Service Plan
+    plan = web_client.app_service_plans.get(resource_group, app_service_plan)
+
+    # Create Web App parameters
+    site_config = {
+        'linux_fx_version': runtime_stack if os_type.lower() == 'linux' else None,
+        'windows_fx_version': runtime_stack if os_type.lower() == 'windows' else None,
+        'http20_enabled': True,
+        'min_tls_version': '1.2',
+        'ftps_state': 'FtpsOnly',
+        'reserved': os_type.lower() == 'linux'
+    }
+
+    site_parameters = {
+        'location': location,
+        'server_farm_id': plan.id,
+        'site_config': site_config,
+        'https_only': https_only,
+        'client_affinity_enabled': client_affinity_enabled,
+        'tags': tags or {}
+    }
+
+    # Create the Web App
+    web_app = web_client.web_apps.begin_create_or_update(
+        resource_group,
+        name,
+        site_parameters
+    ).result()
+
+    return {
+        'id': web_app.id,
+        'name': web_app.name,
+        'location': web_app.location,
+        'default_host_name': web_app.default_host_name,
+        'enabled_host_names': web_app.enabled_host_names,
+        'state': web_app.state,
+        'server_farm_id': web_app.server_farm_id,
+        'site_config': {
+            'linux_fx_version': web_app.site_config.linux_fx_version,
+            'windows_fx_version': web_app.site_config.windows_fx_version,
+            'http20_enabled': web_app.site_config.http20_enabled,
+            'min_tls_version': web_app.site_config.min_tls_version,
+            'ftps_state': web_app.site_config.ftps_state
+        },
+        'provisioning_state': web_app.provisioning_state
+    }
+
+@mcp.tool(description="Deploys a Docker container to an Azure Web App.")
+async def deploy_docker_to_web_app(
+    resource_group: str,
+    name: str,
+    image: str,
+    registry_url: Optional[str] = None,
+    registry_username: Optional[str] = None,
+    registry_password: Optional[str] = None,
+    startup_command: Optional[str] = None,
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Deploy a Docker container to an Azure Web App.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the Web App
+        image: Docker image name and tag (e.g., 'nginx:latest')
+        registry_url: Private registry URL (if using private registry)
+        registry_username: Registry username (if using private registry)
+        registry_password: Registry password (if using private registry)
+        startup_command: Optional startup command for the container
+        tags: Optional tags for the Web App
+    
+    Returns:
+        Dictionary containing the updated Web App details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    try:
+        # Get the existing Web App
+        web_app = web_client.web_apps.get(resource_group, name)
+        
+        # Prepare site config
+        site_config = web_app.site_config or SiteConfig()
+        site_config.linux_fx_version = f"DOCKER|{image}"
+        if startup_command:
+            site_config.app_command_line = startup_command
+
+        # Prepare container settings
+        container_settings = {}
+        if registry_url and registry_username and registry_password:
+            container_settings = {
+                'DOCKER_REGISTRY_SERVER_URL': f"https://{registry_url}",
+                'DOCKER_REGISTRY_SERVER_USERNAME': registry_username,
+                'DOCKER_REGISTRY_SERVER_PASSWORD': registry_password
+            }
+
+        # Update Web App parameters
+        site_parameters = {
+            'location': web_app.location,
+            'site_config': site_config,
+            'tags': tags or web_app.tags
+        }
+
+        if web_app.server_farm_id:
+            site_parameters['server_farm_id'] = web_app.server_farm_id
+        
+        if hasattr(web_app, 'https_only'):
+            site_parameters['https_only'] = web_app.https_only
+            
+        if hasattr(web_app, 'client_affinity_enabled'):
+            site_parameters['client_affinity_enabled'] = web_app.client_affinity_enabled
+
+        # Update the Web App
+        poller = web_client.web_apps.begin_create_or_update(
+            resource_group,
+            name,
+            site_parameters
+        )
+        
+        # Wait for the operation to complete
+        updated_app = poller.result()
+
+        # Update container settings if needed
+        if container_settings:
+            current_settings = web_client.web_apps.list_application_settings(resource_group, name)
+            updated_settings = current_settings.properties.copy()
+            updated_settings.update(container_settings)
+            
+            web_client.web_apps.update_application_settings(
+                resource_group,
+                name,
+                {
+                    'name': name,
+                    'properties': updated_settings
+                }
+            )
+
+        # Get the final state of the web app
+        final_app = web_client.web_apps.get(resource_group, name)
+
+        return {
+            'id': final_app.id,
+            'name': final_app.name,
+            'default_host_name': final_app.default_host_name,
+            'state': final_app.state,
+            'site_config': {
+                'linux_fx_version': final_app.site_config.linux_fx_version,
+                'app_command_line': final_app.site_config.app_command_line if final_app.site_config.app_command_line else None
+            },
+            'enabled': final_app.enabled,
+            'host_names': final_app.host_names,
+            'host_name_ssl_states': [
+                {
+                    'name': ssl_state.name,
+                    'ssl_state': ssl_state.ssl_state,
+                    'virtual_ip': ssl_state.virtual_ip
+                } for ssl_state in (final_app.host_name_ssl_states or [])
+            ] if final_app.host_name_ssl_states else []
+        }
+        
+    except Exception as e:
+        return {
+            'error': str(e),
+            'status': 'failed'
+        }
+
+@mcp.tool(description="Gets detailed information about a Web App including its configuration and settings.")
+async def get_web_app_info(
+    resource_group: str,
+    name: str
+) -> Dict[str, Any]:
+    """Get detailed information about a Web App.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the Web App
+    
+    Returns:
+        Dictionary containing detailed Web App information
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    # Get the Web App
+    web_app = web_client.web_apps.get(resource_group, name)
+
+    # Get application settings
+    app_settings = web_client.web_apps.list_application_settings(resource_group, name)
+
+    # Get publishing profile
+    publishing_profile = web_client.web_apps.list_publishing_profiles(resource_group, name)
+
+    return {
+        'id': web_app.id,
+        'name': web_app.name,
+        'location': web_app.location,
+        'default_host_name': web_app.default_host_name,
+        'enabled_host_names': web_app.enabled_host_names,
+        'state': web_app.state,
+        'server_farm_id': web_app.server_farm_id,
+        'site_config': {
+            'linux_fx_version': web_app.site_config.linux_fx_version,
+            'windows_fx_version': web_app.site_config.windows_fx_version,
+            'http20_enabled': web_app.site_config.http20_enabled,
+            'min_tls_version': web_app.site_config.min_tls_version,
+            'ftps_state': web_app.site_config.ftps_state
+        },
+        'application_settings': app_settings.properties,
+        'publishing_profile': publishing_profile,
+        'provisioning_state': web_app.provisioning_state
+    }
+
+@mcp.tool(description="Updates application settings for a Web App.")
+async def update_web_app_settings(
+    resource_group: str,
+    name: str,
+    settings: Dict[str, str],
+    tags: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Update application settings for a Web App.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the Web App
+        settings: Dictionary of settings to update
+        tags: Optional tags for the Web App
+    
+    Returns:
+        Dictionary containing the updated Web App settings
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    # Get current settings
+    current_settings = web_client.web_apps.list_application_settings(resource_group, name)
+
+    # Update settings
+    updated_settings = current_settings.properties.copy()
+    updated_settings.update(settings)
+
+    # Update the settings
+    result = web_client.web_apps.update_application_settings(
+        resource_group,
+        name,
+        {'name': name, 'properties': updated_settings}
+    )
+
+    # Update tags if provided
+    if tags:
+        web_client.web_apps.update(
+            resource_group,
+            name,
+            {'tags': tags}
+        )
+
+    return {
+        'name': result.name,
+        'settings': result.properties
+    }
+
+@mcp.tool(description="Lists logs from a Web App.")
+async def list_web_app_logs(
+    resource_group: str,
+    name: str,
+    log_type: str = "application",
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None
+) -> Dict[str, Any]:
+    """List logs from a Web App.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the Web App
+        log_type: Type of logs to retrieve (application, http, failed_request_traces)
+        start_time: Start time for log retrieval (ISO format)
+        end_time: End time for log retrieval (ISO format)
+    
+    Returns:
+        Dictionary containing the log entries
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    # Get logs based on type
+    if log_type == "application":
+        logs = web_client.web_apps.get_application_logs(resource_group, name)
+    elif log_type == "http":
+        logs = web_client.web_apps.get_http_logs(resource_group, name)
+    elif log_type == "failed_request_traces":
+        logs = web_client.web_apps.get_failed_request_traces(resource_group, name)
+    else:
+        raise ValueError(f"Unsupported log type: {log_type}")
+
+    return {
+        'log_type': log_type,
+        'logs': logs
+    }
+
+@mcp.tool(description="Restarts a Web App.")
+async def restart_web_app(
+    resource_group: str,
+    name: str,
+    soft_restart: bool = False
+) -> Dict[str, Any]:
+    """Restart a Web App.
+    
+    Args:
+        resource_group: Name of the resource group
+        name: Name of the Web App
+        soft_restart: Whether to perform a soft restart (preserves memory)
+    
+    Returns:
+        Dictionary containing the restart operation status
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    web_client = get_web_client()
+
+    try:
+        if soft_restart:
+            web_client.web_apps.restart(resource_group, name)
+        else:
+            web_client.web_apps.stop(resource_group, name)
+            web_client.web_apps.start(resource_group, name)
+
+        return {
+            'status': 'success',
+            'message': f"Web App {name} has been {'soft restarted' if soft_restart else 'restarted'}"
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+@mcp.tool(description="Updates the HTTP settings for an Application Gateway backend pool.")
+async def update_app_gateway_http_settings(
+    resource_group: str,
+    app_gateway_name: str,
+    settings_name: str,
+    port: int = 443,
+    protocol: str = "Https",
+    cookie_based_affinity: str = "Disabled",
+    timeout: int = 30,
+    host_name: str = None,
+    probe_name: str = None
+) -> Dict[str, Any]:
+    """Updates HTTP settings for an Application Gateway backend pool.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        settings_name: Name of the HTTP settings to update
+        port: Backend port (default: 443)
+        protocol: Backend protocol (Http/Https)
+        cookie_based_affinity: Enable/Disable cookie based affinity
+        timeout: Request timeout in seconds
+        host_name: Override host header with this host name
+        probe_name: Name of the health probe to use
+    
+    Returns:
+        Dictionary containing the updated HTTP settings
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+    
+    try:
+        # Get current Application Gateway
+        app_gateway = network_client.application_gateways.get(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name
+        )
+        
+        # Find or create HTTP settings
+        http_settings = None
+        for setting in app_gateway.backend_http_settings_collection:
+            if setting.name == settings_name:
+                http_settings = setting
+                break
+        
+        if not http_settings:
+            raise ValueError(f"HTTP settings '{settings_name}' not found")
+        
+        # Update settings
+        http_settings.port = port
+        http_settings.protocol = protocol
+        http_settings.cookie_based_affinity = cookie_based_affinity
+        http_settings.request_timeout = timeout
+        
+        if host_name:
+            # Create host name configuration
+            http_settings.host_name_from_backend_pool = False
+            http_settings.pick_host_name_from_backend_address = False
+            http_settings.host_name = host_name
+            
+        if probe_name:
+            probe = next((p for p in app_gateway.probes if p.name == probe_name), None)
+            if probe:
+                http_settings.probe = probe
+        
+        # Update Application Gateway
+        poller = network_client.application_gateways.begin_create_or_update(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name,
+            parameters=app_gateway
+        )
+        
+        result = poller.result()
+        
+        # Find updated settings in result
+        updated_settings = next(
+            (s for s in result.backend_http_settings_collection if s.name == settings_name),
+            None
+        )
+        
+        return {
+            'name': updated_settings.name,
+            'port': updated_settings.port,
+            'protocol': updated_settings.protocol,
+            'cookie_based_affinity': updated_settings.cookie_based_affinity,
+            'request_timeout': updated_settings.request_timeout,
+            'probe': updated_settings.probe.name if updated_settings.probe else None,
+            'host_name': updated_settings.host_name if hasattr(updated_settings, 'host_name') else None,
+            'pick_host_name_from_backend_address': updated_settings.pick_host_name_from_backend_address if hasattr(updated_settings, 'pick_host_name_from_backend_address') else None
+        }
+        
+    except Exception as e:
+        return {
+            'error': str(e),
+            'status': 'failed'
+        }
+
+@mcp.tool(description="Manages SSL certificates for an Application Gateway (both frontend and backend).")
+async def manage_app_gateway_ssl(
+    resource_group: str,
+    app_gateway_name: str,
+    certificate_name: str,
+    certificate_type: str = "frontend",
+    certificate_path: Optional[str] = None,
+    certificate_password: Optional[str] = None,
+    key_vault_secret_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Manages SSL certificates for an Application Gateway.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        certificate_name: Name for the certificate
+        certificate_type: Type of certificate (frontend/backend/root)
+        certificate_path: Path to certificate file (PFX for frontend, CER for backend)
+        certificate_password: Password for PFX certificate
+        key_vault_secret_id: Key Vault secret ID containing the certificate
+    
+    Returns:
+        Dictionary containing the certificate details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+    
+    try:
+        # Get current Application Gateway
+        app_gateway = network_client.application_gateways.get(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name
+        )
+        
+        if certificate_type == "frontend":
+            # Handle frontend SSL certificate
+            if key_vault_secret_id:
+                ssl_certificate = {
+                    'name': certificate_name,
+                    'key_vault_secret_id': key_vault_secret_id
+                }
+            elif certificate_path and certificate_password:
+                with open(certificate_path, 'rb') as cert_file:
+                    cert_data = cert_file.read()
+                    ssl_certificate = {
+                        'name': certificate_name,
+                        'data': base64.b64encode(cert_data).decode('utf-8'),
+                        'password': certificate_password
+                    }
+            else:
+                raise ValueError("Either key_vault_secret_id or both certificate_path and password must be provided")
+            
+            # Update or add SSL certificate
+            cert_found = False
+            for i, cert in enumerate(app_gateway.ssl_certificates):
+                if cert.name == certificate_name:
+                    app_gateway.ssl_certificates[i] = ssl_certificate
+                    cert_found = True
+                    break
+            
+            if not cert_found:
+                app_gateway.ssl_certificates.append(ssl_certificate)
+                
+        elif certificate_type in ["backend", "root"]:
+            # Handle backend/root certificate
+            if not certificate_path:
+                raise ValueError("certificate_path is required for backend/root certificates")
+                
+            with open(certificate_path, 'rb') as cert_file:
+                cert_data = cert_file.read()
+                auth_cert = {
+                    'name': certificate_name,
+                    'data': base64.b64encode(cert_data).decode('utf-8')
+                }
+            
+            # Update or add authentication certificate
+            cert_found = False
+            for i, cert in enumerate(app_gateway.authentication_certificates):
+                if cert.name == certificate_name:
+                    app_gateway.authentication_certificates[i] = auth_cert
+                    cert_found = True
+                    break
+            
+            if not cert_found:
+                app_gateway.authentication_certificates.append(auth_cert)
+        
+        # Update Application Gateway
+        poller = network_client.application_gateways.begin_create_or_update(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name,
+            parameters=app_gateway
+        )
+        
+        result = poller.result()
+        
+        return {
+            'name': certificate_name,
+            'type': certificate_type,
+            'status': 'success'
+        }
+        
+    except Exception as e:
+        return {
+            'error': str(e),
+            'status': 'failed'
+        }
+
+@mcp.tool(description="Manages listeners and routing rules for an Application Gateway.")
+async def manage_app_gateway_routing(
+    resource_group: str,
+    app_gateway_name: str,
+    rule_name: str,
+    listener_protocol: str = "Http",
+    listener_port: int = 80,
+    priority: int = 100,
+    backend_pool_name: str = None,
+    backend_http_settings_name: str = None,
+    path_pattern: str = "/*"
+) -> Dict[str, Any]:
+    """Manages listeners and routing rules for an Application Gateway.
+    
+    Args:
+        resource_group: Name of the resource group
+        app_gateway_name: Name of the Application Gateway
+        rule_name: Name for the routing rule
+        listener_protocol: Protocol for the listener (Http/Https)
+        listener_port: Port for the listener
+        priority: Priority of the routing rule
+        backend_pool_name: Name of the backend pool
+        backend_http_settings_name: Name of the backend HTTP settings
+        path_pattern: URL path pattern for routing
+    
+    Returns:
+        Dictionary containing the routing rule details
+    """
+    if not config.subscription_id:
+        raise ValueError("Azure configuration is missing. Please set AZURE_SUBSCRIPTION_ID environment variable.")
+
+    network_client = get_network_client()
+    
+    try:
+        # Get current Application Gateway
+        app_gateway = network_client.application_gateways.get(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name
+        )
+        
+        # Find or create frontend port
+        port_name = f"port_{listener_port}"
+        frontend_port = next(
+            (p for p in app_gateway.frontend_ports if p.port == listener_port),
+            None
+        )
+        
+        if not frontend_port:
+            frontend_port = {
+                'name': port_name,
+                'port': listener_port
+            }
+            app_gateway.frontend_ports.append(frontend_port)
+        
+        # Create or update listener
+        listener_name = f"{rule_name}-listener"
+        http_listener = {
+            'name': listener_name,
+            'frontend_ip_configuration': app_gateway.frontend_ip_configurations[0],
+            'frontend_port': frontend_port,
+            'protocol': listener_protocol,
+            'require_server_name_indication': False
+        }
+        
+        # Find or create listener
+        listener_found = False
+        for i, listener in enumerate(app_gateway.http_listeners):
+            if listener.name == listener_name:
+                app_gateway.http_listeners[i] = http_listener
+                listener_found = True
+                break
+        
+        if not listener_found:
+            app_gateway.http_listeners.append(http_listener)
+        
+        # Find backend pool and HTTP settings
+        backend_pool = next(
+            (p for p in app_gateway.backend_address_pools if p.name == backend_pool_name),
+            None
+        )
+        if not backend_pool:
+            raise ValueError(f"Backend pool '{backend_pool_name}' not found")
+            
+        http_settings = next(
+            (s for s in app_gateway.backend_http_settings_collection if s.name == backend_http_settings_name),
+            None
+        )
+        if not http_settings:
+            raise ValueError(f"HTTP settings '{backend_http_settings_name}' not found")
+        
+        # Create or update routing rule
+        routing_rule = {
+            'name': rule_name,
+            'rule_type': 'Basic',
+            'priority': priority,
+            'http_listener': http_listener,
+            'backend_address_pool': backend_pool,
+            'backend_http_settings': http_settings,
+            'url_path_map': None
+        }
+        
+        # Find or create rule
+        rule_found = False
+        for i, rule in enumerate(app_gateway.request_routing_rules):
+            if rule.name == rule_name:
+                app_gateway.request_routing_rules[i] = routing_rule
+                rule_found = True
+                break
+        
+        if not rule_found:
+            app_gateway.request_routing_rules.append(routing_rule)
+        
+        # Update Application Gateway
+        poller = network_client.application_gateways.begin_create_or_update(
+            resource_group_name=resource_group,
+            application_gateway_name=app_gateway_name,
+            parameters=app_gateway
+        )
+        
+        result = poller.result()
+        
+        # Find updated rule in result
+        updated_rule = next(
+            (r for r in result.request_routing_rules if r.name == rule_name),
+            None
+        )
+        
+        return {
+            'name': updated_rule.name,
+            'priority': updated_rule.priority,
+            'listener': {
+                'name': updated_rule.http_listener.name,
+                'protocol': updated_rule.http_listener.protocol,
+                'port': updated_rule.http_listener.frontend_port.port
+            },
+            'backend_pool': updated_rule.backend_address_pool.name,
+            'backend_http_settings': updated_rule.backend_http_settings.name
+        }
+        
+    except Exception as e:
+        return {
+            'error': str(e),
+            'status': 'failed'
+        }
 
 if __name__ == "__main__":
     print(f"Starting Azure Resource MCP Server...")
