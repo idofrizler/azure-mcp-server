@@ -12,6 +12,7 @@ dependencies = [
     "azure-mgmt-sql",
     "azure-mgmt-containerregistry",
     "azure-mgmt-web",
+    "azure-mgmt-dns",
     "azure-identity",
     "python-dotenv",
     "pyproject-toml>=0.1.0",
