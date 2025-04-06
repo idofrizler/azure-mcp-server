@@ -13,6 +13,7 @@ from azure_mcp_server.managers.compute_manager import AzureComputeManager
 from azure_mcp_server.managers.webapp_manager import AzureWebAppManager
 from azure_mcp_server.managers.dns_manager import AzureDNSManager
 from azure_mcp_server.tools.dns_tools import DNSTools
+from azure_mcp_server.managers.network_manager import AzureNetworkManager
 
 class AzureMCPServer:
     """Main class for the Azure MCP Server."""
@@ -36,6 +37,7 @@ class AzureMCPServer:
         self.webapp_manager = AzureWebAppManager(self.client_factory)
         self.dns_manager = AzureDNSManager(self.client_factory)
         self.dns_tools = DNSTools(self.dns_manager)
+        self.network_manager = AzureNetworkManager(self.client_factory)
         
         self._register_tools()
 
@@ -54,15 +56,15 @@ class AzureMCPServer:
         self.mcp.tool(description="Create a new Web App")(self.webapp_manager.create_web_app)
         
         # Application Gateway Tools
-        self.mcp.tool(description="Creates an Application Gateway with WAF and configures backend pools")(self.compute_manager.create_app_gateway_with_waf)
-        self.mcp.tool(description="Creates or updates a custom WAF rule in an Application Gateway")(self.compute_manager.create_app_gateway_waf_rule)
-        self.mcp.tool(description="Updates an existing Application Gateway's backend pool configuration")(self.compute_manager.update_app_gateway_backend_pool)
-        self.mcp.tool(description="Gets detailed information about an Application Gateway")(self.compute_manager.get_app_gateway_info)
-        self.mcp.tool(description="Updates WAF configuration on an Application Gateway")(self.compute_manager.update_app_gateway_waf_config)
-        self.mcp.tool(description="Updates HTTP settings for an Application Gateway backend pool")(self.compute_manager.update_app_gateway_http_settings)
-        self.mcp.tool(description="Manages SSL certificates for an Application Gateway")(self.compute_manager.manage_app_gateway_ssl)
-        self.mcp.tool(description="Manages listeners and routing rules for an Application Gateway")(self.compute_manager.manage_app_gateway_routing)
-        self.mcp.tool(description="Manages health probes for an Application Gateway")(self.compute_manager.manage_app_gateway_health)
+        # self.mcp.tool(description="Creates an Application Gateway with WAF and configures backend pools")(self.network_manager.create_app_gateway_with_waf)
+        self.mcp.tool(description="Creates or updates a custom WAF rule in an Application Gateway")(self.network_manager.create_app_gateway_waf_rule)
+        # self.mcp.tool(description="Updates an existing Application Gateway's backend pool configuration")(self.network_manager.update_app_gateway_backend_pool)
+        self.mcp.tool(description="Gets detailed information about an Application Gateway")(self.network_manager.get_app_gateway_info)
+        # self.mcp.tool(description="Updates WAF configuration on an Application Gateway")(self.network_manager.update_app_gateway_waf_config)
+        self.mcp.tool(description="Updates HTTP settings for an Application Gateway backend pool")(self.network_manager.update_app_gateway_http_settings)
+        self.mcp.tool(description="Manages SSL certificates for an Application Gateway")(self.network_manager.manage_app_gateway_ssl)
+        self.mcp.tool(description="Manages listeners and routing rules for an Application Gateway")(self.network_manager.manage_app_gateway_routing)
+        # self.mcp.tool(description="Manages health probes for an Application Gateway")(self.network_manager.manage_app_gateway_health)
         
         # SQL Database Tools
         self.mcp.tool(description="Creates a new Azure SQL Server with optional firewall rules")(self.compute_manager.create_sql_server)
@@ -75,8 +77,8 @@ class AzureMCPServer:
         self.mcp.tool(description="Lists tags for a repository in an Azure Container Registry")(self.compute_manager.list_acr_tags)
         
         # Network Security Group Tools
-        self.mcp.tool(description="Gets detailed information about a Network Security Group")(self.compute_manager.get_nsg_info)
-        self.mcp.tool(description="Creates VNet peering between two virtual networks")(self.compute_manager.create_vnet_peering)
+        self.mcp.tool(description="Gets detailed information about a Network Security Group")(self.network_manager.get_nsg_info)
+        self.mcp.tool(description="Creates VNet peering between two virtual networks")(self.network_manager.create_vnet_peering)
         
         # Web App Additional Tools
         self.mcp.tool(description="Creates an App Service Plan in Azure")(self.webapp_manager.create_app_service_plan)
